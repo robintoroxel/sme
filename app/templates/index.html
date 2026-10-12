@@ -11,6 +11,11 @@
           {% for m in models %}<option value="{{ m }}">{{ m }}</option>{% endfor %}
         </select>
       </label>
+      <label>Priority
+        <select name="prio">
+          {% for p, label in prios.items() %}<option value="{{ p }}" {{ 'selected' if p == default_prio }}>{{ label }}</option>{% endfor %}
+        </select>
+      </label>
       <button type="submit">Create &amp; hand to agent</button>
     </div>
   </form>
@@ -24,18 +29,19 @@
     {% endfor %}
   </nav>
   <table class="tickets">
-    <thead><tr><th>#</th><th>Title</th><th>Status</th><th>Model</th><th>Updated</th></tr></thead>
+    <thead><tr><th>#</th><th>Title</th><th>Prio</th><th>Status</th><th>Model</th><th>Updated</th></tr></thead>
     <tbody>
       {% for t in tickets %}
       <tr>
         <td>{{ t.id }}</td>
         <td><a href="/tickets/{{ t.id }}">{{ t.title }}</a></td>
+        <td><span class="badge prio-{{ t.prio }}">{{ prios.get(t.prio, t.prio) }}</span></td>
         <td><span class="badge {{ t.status }}">{{ t.status }}</span></td>
         <td class="muted">{{ t.model.split('/')[-1] }}</td>
         <td class="muted">{{ t.updated_at }}</td>
       </tr>
       {% else %}
-      <tr><td colspan="5" class="muted">No tickets yet.</td></tr>
+      <tr><td colspan="6" class="muted">No tickets yet.</td></tr>
       {% endfor %}
     </tbody>
   </table>

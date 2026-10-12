@@ -9,7 +9,7 @@
     <h2>#{{ t.id }} {{ t.title }}</h2>
     <span class="badge {{ t.status }}" id="ticket-status">{{ t.status }}</span>
   </div>
-  <p class="muted">{{ t.model }} · created {{ t.created_at }}{% if t.session_id %} · session <code>{{ t.session_id }}</code>{% endif %}</p>
+  <p class="muted">{{ t.model }} · prio {{ prio_labels.get(t.prio, t.prio) }} · created {{ t.created_at }}{% if t.session_id %} · session <code>{{ t.session_id }}</code>{% endif %}</p>
   {% if t.description %}<pre class="desc">{{ t.description }}</pre>{% endif %}
   <div class="row">
     {% if active %}

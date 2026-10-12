@@ -66,6 +66,9 @@ table.tickets { width: 100%; border-collapse: collapse; background: var(--card);
 .badge.done { background: #d3f9d8; color: #2b8a3e; }
 .badge.failed { background: #ffe3e3; color: #c92a2a; }
 .badge.cancelled, .badge.reverted { background: #e9ecef; color: #495057; }
+.badge.prio-1 { background: #d3f9d8; color: #2b8a3e; }
+.badge.prio-2 { background: #fff3bf; color: #8a6100; }
+.badge.prio-3 { background: #ffe3e3; color: #c92a2a; }
 pre { white-space: pre-wrap; word-break: break-word; margin: 6px 0; }
 pre.desc { background: var(--bg); padding: 10px; border-radius: 6px; }
 pre.log {

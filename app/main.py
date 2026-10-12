@@ -14,6 +14,8 @@ APP_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "data" / "logs"
 MODELS = ["deepseek/deepseek-v4-pro", "deepseek/deepseek-flash"]
 STATUSES = ["queued", "running", "done", "failed", "cancelled", "reverted"]
+PRIO_LABELS = {1: "low", 2: "medium", 3: "high"}
+DEFAULT_PRIO = 2
 
 
 @asynccontextmanager
@@ -68,21 +70,36 @@ def index(request: Request, status: str | None = None):
     return templates.TemplateResponse(
         request,
         "index.html",
-        {"tickets": tickets, "counts": counts, "status": status, "statuses": STATUSES, "models": MODELS},
+        {
+            "tickets": tickets,
+            "counts": counts,
+            "status": status,
+            "statuses": STATUSES,
+            "models": MODELS,
+            "prios": PRIO_LABELS,
+            "default_prio": DEFAULT_PRIO,
+        },
     )
 
 
 @app.post("/tickets")
-def create_ticket(title: str = Form(...), description: str = Form(""), model: str = Form(MODELS[0])):
+def create_ticket(
+    title: str = Form(...),
+    description: str = Form(""),
+    model: str = Form(MODELS[0]),
+    prio: int = Form(DEFAULT_PRIO),
+):
     title = title.strip()
     if not title:
         raise HTTPException(400, "Title is required")
     if model not in MODELS:
         model = MODELS[0]
+    if prio not in PRIO_LABELS:
+        prio = DEFAULT_PRIO
     conn = db()
     cur = conn.execute(
-        "INSERT INTO tickets (title, description, model) VALUES (?, ?, ?)",
-        (title, description.strip(), model),
+        "INSERT INTO tickets (title, description, model, prio) VALUES (?, ?, ?, ?)",
+        (title, description.strip(), model, prio),
     )
     tid = cur.lastrowid
     prompt = f"Ticket #{tid}: {title}\n\n{description.strip()}".strip()
@@ -103,7 +120,7 @@ def ticket_detail(request: Request, ticket_id: int, error: str | None = None):
     return templates.TemplateResponse(
         request,
         "ticket.html",
-        {"t": t, "runs": runs, "logs": logs, "active": active, "error": error},
+        {"t": t, "runs": runs, "logs": logs, "active": active, "error": error, "prio_labels": PRIO_LABELS},
     )
 
 

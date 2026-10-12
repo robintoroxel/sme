@@ -34,7 +34,10 @@ def check(resp, what):
 with TestClient(app) as c:  # entering runs the lifespan, i.e. the migrations
     check(c.get("/healthz"), "GET /healthz")
     check(c.get("/"), "GET /")
-    r = c.post("/tickets", data={"title": "smoke test", "description": "created by smoke.py"})
+    r = c.post(
+        "/tickets",
+        data={"title": "smoke test", "description": "created by smoke.py", "prio": "3"},
+    )
     check(r, "POST /tickets")
     conn = connect()
     ids = [row[0] for row in conn.execute("SELECT id FROM tickets ORDER BY id DESC LIMIT 20")]
@@ -42,5 +45,10 @@ with TestClient(app) as c:  # entering runs the lifespan, i.e. the migrations
     for tid in ids:
         check(c.get(f"/tickets/{tid}"), f"GET /tickets/{tid}")
         check(c.get(f"/api/tickets/{tid}"), f"GET /api/tickets/{tid}")
+
+    conn = connect()
+    prio = conn.execute("SELECT prio FROM tickets WHERE id = ?", (ids[0],)).fetchone()[0]
+    conn.close()
+    assert prio == 3, f"prio should be stored as 3, got {prio}"
 
 print(f"smoke OK ({len(ids)} ticket pages checked)")
