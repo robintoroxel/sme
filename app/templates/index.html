@@ -1,5 +1,15 @@
 {% extends "base.html" %}
 {% block content %}
+{% if worker.get('mode') == 'fallback' %}
+<div class="error">The agent worker keeps crashing and is running in <strong>fallback mode</strong>
+  (last known-good version, git tag <code>tix-worker-good</code>). File a ticket to fix <code>worker.py</code>,
+  or fix it by hand.</div>
+{% endif %}
+{% if orphans %}
+<div class="error">Applied migrations whose file no longer exists (probably reverted):
+  {% for o in orphans %}<code>{{ o }}</code>{{ ', ' if not loop.last }}{% endfor %}.
+  Their schema changes are still in the live database.</div>
+{% endif %}
 <section class="card">
   <h2>New ticket</h2>
   <form method="post" action="/tickets" class="stack">

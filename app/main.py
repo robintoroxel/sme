@@ -1,4 +1,5 @@
 """Web UI for the ticket system."""
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -7,13 +8,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import gitops
-from .db import ROOT, connect, migrate
+from . import gitops, runs
+from .db import ROOT, connect, migrate, orphan_migrations
 
 APP_DIR = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "data" / "logs"
 MODELS = ["deepseek/deepseek-v4-pro", "deepseek/deepseek-flash"]
-STATUSES = ["queued", "running", "done", "failed", "cancelled", "reverted"]
+STATUSES = ["queued", "running", "review", "done", "failed", "cancelled", "rejected", "reverted"]
 PRIO_LABELS = {1: "low", 2: "medium", 3: "high"}
 DEFAULT_PRIO = 2
 
@@ -62,6 +63,13 @@ def get_ticket(conn, ticket_id: int):
     return t
 
 
+def worker_status() -> dict:
+    try:
+        return json.loads((ROOT / "data" / "worker.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
 def read_log(run_id: int) -> str:
     p = LOG_DIR / f"run-{run_id}.log"
     return p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
@@ -87,6 +95,7 @@ def index(request: Request, status: str | None = None):
         args = (status,)
     tickets = conn.execute(q + " ORDER BY t.id DESC", args).fetchall()
     counts = dict(conn.execute("SELECT status, COUNT(*) FROM tickets GROUP BY status").fetchall())
+    orphans = orphan_migrations(conn)
     conn.close()
     return templates.TemplateResponse(
         request,
@@ -99,6 +108,8 @@ def index(request: Request, status: str | None = None):
             "models": MODELS,
             "prios": PRIO_LABELS,
             "default_prio": DEFAULT_PRIO,
+            "orphans": orphans,
+            "worker": worker_status(),
         },
     )
 
@@ -153,9 +164,7 @@ def followup(ticket_id: int, body: str = Form(...)):
     conn = db()
     get_ticket(conn, ticket_id)
     conn.execute("INSERT INTO runs (ticket_id, prompt) VALUES (?, ?)", (ticket_id, body))
-    conn.execute(
-        "UPDATE tickets SET status = 'queued', updated_at = datetime('now') WHERE id = ?", (ticket_id,)
-    )
+    runs.refresh_ticket_status(conn, ticket_id)
     conn.commit()
     conn.close()
     return see_other(f"/tickets/{ticket_id}")
@@ -173,14 +182,7 @@ def cancel(ticket_id: int):
     conn.execute(
         "UPDATE runs SET cancel_requested = 1 WHERE ticket_id = ? AND status = 'running'", (ticket_id,)
     )
-    running = conn.execute(
-        "SELECT 1 FROM runs WHERE ticket_id = ? AND status = 'running'", (ticket_id,)
-    ).fetchone()
-    if not running:
-        conn.execute(
-            "UPDATE tickets SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?",
-            (ticket_id,),
-        )
+    runs.refresh_ticket_status(conn, ticket_id)
     conn.commit()
     conn.close()
     return see_other(f"/tickets/{ticket_id}")
@@ -212,6 +214,37 @@ def revert(ticket_id: int):
     return see_other(f"/tickets/{ticket_id}")
 
 
+def get_run(conn, run_id: int):
+    r = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if not r:
+        raise HTTPException(404, "Run not found")
+    return r
+
+
+@app.post("/runs/{run_id}/approve")
+def approve(run_id: int):
+    conn = db()
+    r = get_run(conn, run_id)
+    if r["status"] != "review":
+        conn.close()
+        return see_other(f"/tickets/{r['ticket_id']}")
+    ok, msg = runs.merge_run(conn, run_id)
+    conn.close()
+    if not ok:
+        return see_other(f"/tickets/{r['ticket_id']}?error=Merge+failed:+{msg[:300]}")
+    return see_other(f"/tickets/{r['ticket_id']}")
+
+
+@app.post("/runs/{run_id}/reject")
+def reject(run_id: int):
+    conn = db()
+    r = get_run(conn, run_id)
+    if r["status"] == "review":
+        runs.reject_run(conn, run_id)
+    conn.close()
+    return see_other(f"/tickets/{r['ticket_id']}")
+
+
 @app.get("/runs/{run_id}/log", response_class=PlainTextResponse)
 def run_log(run_id: int):
     return read_log(run_id)
@@ -220,11 +253,13 @@ def run_log(run_id: int):
 @app.get("/runs/{run_id}/diff", response_class=PlainTextResponse)
 def run_diff(run_id: int):
     conn = db()
-    r = conn.execute("SELECT commit_sha FROM runs WHERE id = ?", (run_id,)).fetchone()
+    r = get_run(conn, run_id)
     conn.close()
-    if not r or not r["commit_sha"]:
-        raise HTTPException(404, "No commit for this run")
-    return gitops.show(r["commit_sha"])
+    if r["commit_sha"]:
+        return gitops.show(r["commit_sha"])
+    if r["branch"] and gitops.branch_exists(r["branch"]):
+        return gitops.branch_diff(r["branch"])
+    raise HTTPException(404, "No changes recorded for this run")
 
 
 @app.get("/api/tickets/{ticket_id}")

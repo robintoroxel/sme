@@ -33,7 +33,20 @@
   <details {% if loop.index > 1 %}open{% endif %}><summary>Prompt</summary><pre>{{ r.prompt }}</pre></details>
   {% if r.summary %}<div class="summary"><strong>Agent summary</strong><pre>{{ r.summary }}</pre></div>{% endif %}
   {% if r.error %}<div class="error"><pre>{{ r.error }}</pre></div>{% endif %}
-  {% if r.commit_sha %}<p>Commit <a href="/runs/{{ r.id }}/diff"><code>{{ r.commit_sha[:10] }}</code></a> (view diff)</p>{% endif %}
+  {% if r.commit_sha %}<p>Commit <a href="/runs/{{ r.id }}/diff"><code>{{ r.commit_sha[:10] }}</code></a> (view diff)</p>
+  {% elif r.branch and r.status in ('review', 'failed', 'cancelled') %}<p>Branch <a href="/runs/{{ r.id }}/diff"><code>{{ r.branch }}</code></a> (view diff, not live)</p>{% endif %}
+  {% if r.status == 'review' %}
+  <div class="review">
+    <strong>Waiting for your approval.</strong> {{ r.review_reason or '' }}
+    <p class="muted">The change passed all checks in staging. Approving merges it into the live app;
+      any new migrations are then applied to the live database.</p>
+    <div class="row">
+      <form method="post" action="/runs/{{ r.id }}/approve"><button>Approve &amp; merge</button></form>
+      <form method="post" action="/runs/{{ r.id }}/reject"
+            onsubmit="return confirm('Discard this change?')"><button class="danger">Reject</button></form>
+    </div>
+  </div>
+  {% endif %}
   <details {% if r.status in ('queued', 'running') %}open{% endif %}>
     <summary>Agent log</summary>
     <pre class="log" id="log-{{ r.id }}">{{ logs[r.id] }}</pre>

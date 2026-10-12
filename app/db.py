@@ -8,8 +8,9 @@ import os
 import sqlite3
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+# TIX_ROOT lets the fallback worker (a copy living in data/fallback/) operate on the real repo.
+ROOT = Path(os.environ.get("TIX_ROOT") or Path(__file__).resolve().parent.parent)
+MIGRATIONS_DIR = ROOT / "app" / "migrations"
 
 
 def db_path() -> Path:
@@ -23,6 +24,16 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def copy_db(src: Path, dst: Path) -> None:
+    """Consistent copy of a (possibly in-use) database."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.unlink(missing_ok=True)
+    s, d = sqlite3.connect(src), sqlite3.connect(dst)
+    s.backup(d)
+    s.close()
+    d.close()
 
 
 def migrate(conn: sqlite3.Connection) -> list[str]:
@@ -48,3 +59,10 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
             raise
         applied.append(f.name)
     return applied
+
+
+def orphan_migrations(conn: sqlite3.Connection) -> list[str]:
+    """Migrations applied to this DB whose file no longer exists (e.g. after a revert)."""
+    files = {f.name for f in MIGRATIONS_DIR.glob("*.sql")}
+    rows = conn.execute("SELECT name FROM schema_migrations ORDER BY name").fetchall()
+    return [r[0] for r in rows if r[0] not in files]

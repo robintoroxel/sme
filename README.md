@@ -7,21 +7,34 @@ A ticket system that develops itself. File a ticket in the web UI and an
 
 ```bash
 cd /mnt/c/Users/rtoroxel_ailio/erp
-bash run.sh            # web UI on http://localhost:8000, plus the agent worker
+bash run.sh            # web UI on http://localhost:8000, plus the supervised agent worker
 ```
 
 `run.sh` needs `uv` and `opencode` on PATH, and `DEEPSEEK_ERP_API_KEY` set in `.env`.
 
-## How it works
-- Each ticket, and each follow-up comment, becomes a **run**. `worker.py` handles runs one at a time.
-- A run calls `opencode run --model deepseek/deepseek-v4-pro`. Follow-ups continue the same opencode session.
-- After the agent finishes, `smoke.py` checks the app against a copy of the DB. If the check fails,
-  the agent gets the error and up to 2 tries to fix it. If it still fails, its changes are stashed (`git stash list`).
-- A successful run becomes one git commit, which you can view in the UI as a diff and **revert** from the ticket page.
-- Schema changes go in new files under `app/migrations/`, applied automatically.
-- The web server reloads on code changes. The worker restarts itself after every run.
+## How a ticket flows
+1. Each ticket, and each follow-up comment, becomes a **run**. `worker.py` handles runs one at a time.
+2. The agent works in a **staging worktree** (`~/.local/share/tix/work`, branch `tix/run-N`) with a
+   copy of the live DB. The live app and DB are untouched while it works.
+3. Checks: compile, import, then `smoke.py`. If a check fails, the agent gets the error and up to 2 tries to fix it.
+   If it still fails, the run fails and the attempt is kept on its branch, where you can view the diff.
+4. If the checks pass, the change is **squash-merged** into the live checkout as one commit. The web server
+   reloads and applies new migrations to the live DB. The exceptions are changes to **protected files**
+   (worker, checks, agent rules, permissions, git/DB plumbing) and `TIX_AUTO_MERGE=never`: those wait
+   in status **review** for you to **Approve** or **Reject**.
+5. A follow-up on a ticket awaiting review builds on that unmerged branch. A merged ticket can be **reverted**.
+
+## Self-reference safeguards
+- The agent never edits the live checkout, so a half-finished change can't take the app down or migrate the live DB.
+- The worker defines its own checks, so the agent can't get around them by editing `smoke.py`.
+- The agent can't change its own guardrails without approval: edits to `worker.py`, `smoke.py`, `run.sh`,
+  `AGENTS.md`, `opencode.json`, `app/db.py`, `app/gitops.py` and `app/runs.py` always need it.
+- `run.sh` restarts a crashed worker. After 3 quick crashes in a row it runs the last known-good
+  worker (git tag `tix-worker-good`, moved after every healthy run), so a ticket can still fix the broken one.
+  The UI shows a banner while this fallback is active.
+- The UI warns about migrations applied to the live DB whose file has since been reverted.
 
 Agent rules live in `AGENTS.md`; model and permissions live in `opencode.json`.
 
-Environment knobs: `PORT`, `TIX_RUN_TIMEOUT` (seconds, default 2700), `TIX_FIX_ATTEMPTS` (default 2),
-`TIX_OPENCODE_ARGS` (extra flags for `opencode run`).
+Environment knobs: `PORT`, `TIX_AUTO_MERGE` (`safe` default | `never`), `TIX_RUN_TIMEOUT` (seconds, default 2700),
+`TIX_FIX_ATTEMPTS` (default 2), `TIX_WORK_DIR`, `TIX_OPENCODE_ARGS` (extra flags for `opencode run`).

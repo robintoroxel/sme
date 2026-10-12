@@ -1,11 +1,16 @@
-"""Agent worker: picks queued runs and lets opencode implement them in this repo.
+"""Agent worker: picks queued runs and lets opencode implement them.
 
-For each run:
-  1. commit any manual (uncommitted) changes so the agent starts from a clean tree
-  2. run `opencode run` with the ticket as prompt (follow-ups continue the session)
-  3. run smoke.py; if it fails, ask the agent to fix it (up to FIX_ATTEMPTS times)
-  4. on success commit everything as one commit; on failure stash the changes away
-The worker re-executes itself after every run so changes to its own code take effect.
+The agent never touches the live checkout. For each run:
+  1. commit any manual (uncommitted) changes in the live checkout
+  2. create a staging worktree (TIX_WORK_DIR) on branch tix/run-N with a copy of the live DB
+     (a follow-up on a ticket that is awaiting review builds on that review branch)
+  3. run `opencode run` there (follow-ups continue the session)
+  4. run the checks (compile, import, smoke.py); on failure let the agent fix it, FIX_ATTEMPTS times
+  5. commit on the branch; then either squash-merge into the live checkout (it goes live via
+     auto-reload) or, if protected files changed / TIX_AUTO_MERGE=never, wait for approval in the UI
+The worker re-executes itself after every run and whenever the live HEAD moves, so merged
+changes to its own code take effect. run.sh falls back to the last known-good worker
+(git tag tix-worker-good) if the current one keeps crashing.
 """
 import json
 import os
@@ -17,14 +22,18 @@ import time
 import traceback
 from pathlib import Path
 
-from app import gitops
-from app.db import ROOT, connect, migrate
+from app import gitops, runs
+from app.db import ROOT, connect, copy_db, db_path, migrate
 
 LOG_DIR = ROOT / "data" / "logs"
+STATUS_FILE = ROOT / "data" / "worker.json"
+WORK_DIR = Path(os.environ.get("TIX_WORK_DIR") or Path.home() / ".local" / "share" / "tix" / "work")
 OPENCODE = os.environ.get("TIX_OPENCODE", "opencode")
 EXTRA_ARGS = os.environ.get("TIX_OPENCODE_ARGS", "").split()
 RUN_TIMEOUT = int(os.environ.get("TIX_RUN_TIMEOUT", "2700"))
 FIX_ATTEMPTS = int(os.environ.get("TIX_FIX_ATTEMPTS", "2"))
+AUTO_MERGE = os.environ.get("TIX_AUTO_MERGE", "safe")  # safe: unless protected files change | never
+MODE = os.environ.get("TIX_WORKER_MODE", "normal")  # normal | fallback (set by run.sh)
 POLL_SECONDS = 2
 
 PREAMBLE = """You are the autonomous developer of "tix", the ticket system in the current
@@ -34,6 +43,12 @@ them in your final message. Do not commit; the worker commits for you.
 When done, reply with a short summary of what you changed.
 
 """
+
+CHECKS = [
+    ("compile", [sys.executable, "-m", "compileall", "-q", "app", "worker.py", "smoke.py"]),
+    ("import", [sys.executable, "-c", "import worker, app.main, app.runs, app.gitops"]),
+    ("smoke", [sys.executable, "smoke.py"]),
+]
 
 
 def load_env() -> None:
@@ -45,6 +60,14 @@ def load_env() -> None:
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def child_env() -> dict:
+    """Environment for agent and checks: they must resolve paths inside the worktree."""
+    env = dict(os.environ)
+    for k in ("TIX_ROOT", "TIX_DB", "TIX_WORKER_MODE"):
+        env.pop(k, None)
+    return env
 
 
 class RunLog:
@@ -99,7 +122,7 @@ def cancel_requested(run_id: int) -> bool:
 
 
 def run_agent(prompt: str, model: str, session_id: str | None, log: RunLog, run_id: int):
-    """Run opencode once. Returns (returncode, session_id, last_text, cancelled)."""
+    """Run opencode once in the worktree. Returns (returncode, session_id, last_text, cancelled)."""
     cmd = [OPENCODE, "run", "--format", "json", "--model", model, *EXTRA_ARGS]
     if session_id:
         cmd += ["--session", session_id]
@@ -107,8 +130,9 @@ def run_agent(prompt: str, model: str, session_id: str | None, log: RunLog, run_
     log.write(f"$ opencode run --model {model}" + (f" --session {session_id}" if session_id else ""))
 
     proc = subprocess.Popen(
-        cmd, cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace", bufsize=1, start_new_session=True,
+        cmd, cwd=WORK_DIR, env=child_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
+        start_new_session=True,
     )
     state = {"session": session_id, "last_text": ""}
 
@@ -148,62 +172,72 @@ def run_agent(prompt: str, model: str, session_id: str | None, log: RunLog, run_
     return proc.returncode, state["session"], state["last_text"], cancelled
 
 
-def smoke(log: RunLog) -> tuple[bool, str]:
-    log.write("$ python smoke.py")
-    try:
-        r = subprocess.run(
-            [sys.executable, "smoke.py"], cwd=ROOT, capture_output=True, text=True, timeout=180
-        )
-        out, ok = (r.stdout + r.stderr).strip(), r.returncode == 0
-    except subprocess.TimeoutExpired:
-        out, ok = "smoke.py timed out after 180s", False
-    log.write(out or "(no output)")
-    log.write("smoke: OK" if ok else "smoke: FAILED")
-    return ok, out
+def run_checks(log: RunLog) -> tuple[bool, str]:
+    """Checks defined here (not in the agent-editable smoke.py alone) gate every change."""
+    for name, cmd in CHECKS:
+        log.write(f"$ check: {name}")
+        try:
+            r = subprocess.run(cmd, cwd=WORK_DIR, env=child_env(), capture_output=True, text=True, timeout=180)
+            out, ok = (r.stdout + r.stderr).strip(), r.returncode == 0
+        except subprocess.TimeoutExpired:
+            out, ok = f"check '{name}' timed out after 180s", False
+        if out:
+            log.write(out)
+        if not ok:
+            log.write(f"check {name}: FAILED")
+            return False, f"[{name}] {out}"
+    log.write("checks: OK")
+    return True, ""
 
 
-def discard(base: str, label: str, log: RunLog) -> None:
-    """Undo the agent's work but keep it recoverable in `git stash list`."""
-    if gitops.head() != base:
-        gitops.git("reset", "-q", "--soft", base)
-    if gitops.is_dirty():
-        gitops.git("stash", "push", "-u", "-q", "-m", label)
-        log.write(f"Changes stashed as '{label}' (see `git stash list`).")
-
-
-def finish(conn, run_id: int, ticket_id: int, status: str, **fields) -> None:
-    sets = ", ".join(f"{k} = ?" for k in fields)
-    sql = (
+def finish(conn, run_id: int, status: str, **fields) -> None:
+    sets = "".join(f", {k} = ?" for k in fields)
+    conn.execute(
         "UPDATE runs SET status = ?, finished_at = datetime('now'),"
         " duration_seconds = CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER)"
-        f"{', ' + sets if sets else ''} WHERE id = ?"
+        f"{sets} WHERE id = ?",
+        (status, *fields.values(), run_id),
     )
-    conn.execute(sql, (status, *fields.values(), run_id))
-    # A cancelled run only cancels the ticket if nothing else is pending for it.
-    pending = conn.execute(
-        "SELECT 1 FROM runs WHERE ticket_id = ? AND status = 'queued'", (ticket_id,)
-    ).fetchone()
-    if not pending:
-        conn.execute(
-            "UPDATE tickets SET status = ?, updated_at = datetime('now') WHERE id = ?", (status, ticket_id)
-        )
+    ticket_id = conn.execute("SELECT ticket_id FROM runs WHERE id = ?", (run_id,)).fetchone()[0]
+    runs.refresh_ticket_status(conn, ticket_id)
     conn.commit()
 
 
-def process(run_id: int) -> None:
+def keep_attempt(base: str, message: str, log: RunLog) -> None:
+    """Commit a failed/cancelled attempt on its branch so the diff stays inspectable."""
+    if gitops.head(WORK_DIR) != base:
+        gitops.git("reset", "-q", "--soft", base, cwd=WORK_DIR)
+    if gitops.commit_all(message, cwd=WORK_DIR):
+        log.write("Attempt kept on its branch (not merged); see the diff link.")
+
+
+def process(run_id: int) -> bool:
+    """Handle one run. Returns False if the worker itself hit an unexpected error."""
     conn = connect()
     run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     t = conn.execute("SELECT * FROM tickets WHERE id = ?", (run["ticket_id"],)).fetchone()
-    conn.execute("UPDATE runs SET status = 'running', started_at = datetime('now') WHERE id = ?", (run_id,))
-    conn.execute("UPDATE tickets SET status = 'running', updated_at = datetime('now') WHERE id = ?", (t["id"],))
+    branch = f"tix/run-{run_id}"
+    conn.execute(
+        "UPDATE runs SET status = 'running', started_at = datetime('now'), branch = ? WHERE id = ?",
+        (branch, run_id),
+    )
+    runs.refresh_ticket_status(conn, t["id"])
     conn.commit()
 
     log = RunLog(run_id)
     try:
-        if gitops.is_dirty():
-            sha = gitops.commit_all(f"Manual changes (auto-committed before ticket #{t['id']})")
-            log.write(f"Committed pending manual changes as {sha[:10]}.")
-        base = gitops.head()
+        sha = gitops.commit_manual_changes(f"before ticket #{t['id']}")
+        if sha:
+            log.write(f"Committed pending manual changes in the live checkout as {sha[:10]}.")
+        pending = conn.execute(
+            "SELECT branch FROM runs WHERE ticket_id = ? AND status = 'review' ORDER BY id DESC LIMIT 1",
+            (t["id"],),
+        ).fetchone()
+        base_ref = pending["branch"] if pending and gitops.branch_exists(pending["branch"]) else "HEAD"
+        gitops.create_worktree(WORK_DIR, branch, base_ref)
+        base = gitops.head(WORK_DIR)
+        copy_db(db_path(), WORK_DIR / "data" / "tickets.db")
+        log.write(f"Staging worktree {WORK_DIR} on {branch} (from {base_ref}, {base[:10]}) with a copy of the DB.")
 
         first = t["session_id"] is None
         prompt = PREAMBLE + run["prompt"] if first else (
@@ -215,63 +249,108 @@ def process(run_id: int) -> None:
             conn.execute("UPDATE tickets SET session_id = ? WHERE id = ?", (sid, t["id"]))
             conn.commit()
 
-        if cancelled:
-            discard(base, f"tix: cancelled run {run_id} (ticket #{t['id']})", log)
-            return finish(conn, run_id, t["id"], "cancelled", error="Cancelled or timed out.")
-        if rc != 0:
-            discard(base, f"tix: failed run {run_id} (ticket #{t['id']})", log)
-            return finish(conn, run_id, t["id"], "failed", error=f"opencode exited with code {rc}; see log.")
+        if cancelled or rc != 0:
+            keep_attempt(base, f"tix run {run_id} (ticket #{t['id']}): unfinished attempt", log)
+            if cancelled:
+                finish(conn, run_id, "cancelled", error="Cancelled or timed out.")
+            else:
+                finish(conn, run_id, "failed", error=f"opencode exited with code {rc}; see log.")
+            return True
 
-        ok, out = smoke(log)
+        ok, out = run_checks(log)
         for attempt in range(FIX_ATTEMPTS):
             if ok:
                 break
-            log.write(f"-- asking agent to fix smoke failure (attempt {attempt + 1}/{FIX_ATTEMPTS})")
+            log.write(f"-- asking agent to fix the failing check (attempt {attempt + 1}/{FIX_ATTEMPTS})")
             fix_prompt = (
-                "After your change, the smoke test (`python smoke.py`) fails with:\n\n"
-                f"{out[-6000:]}\n\nFix the problem so smoke.py passes, without dropping the ticket's goal."
+                "After your change, a required check fails:\n\n"
+                f"{out[-6000:]}\n\nFix the problem so all checks (compile, import, `python smoke.py`) pass, "
+                "without dropping the ticket's goal."
             )
             rc, sid, s2, cancelled = run_agent(fix_prompt, t["model"], sid, log, run_id)
             summary = s2 or summary
             if cancelled or rc != 0:
                 break
-            ok, out = smoke(log)
+            ok, out = run_checks(log)
 
         if not ok:
-            discard(base, f"tix: failed run {run_id} (ticket #{t['id']})", log)
-            return finish(conn, run_id, t["id"], "failed", summary=summary, error="Smoke test failed:\n" + out[-4000:])
+            keep_attempt(base, f"tix run {run_id} (ticket #{t['id']}): failed checks", log)
+            finish(conn, run_id, "failed", summary=summary, error="Checks failed:\n" + out[-4000:])
+            return True
 
-        if gitops.head() != base:  # the agent committed on its own; squash into our commit
-            gitops.git("reset", "-q", "--soft", base)
-        sha = gitops.commit_all(f"#{t['id']} {t['title']}\n\n{summary[:3000]}\n\ntix run {run_id}")
-        log.write(f"Committed {sha[:10]}." if sha else "Agent made no file changes.")
-        finish(conn, run_id, t["id"], "done", summary=summary, commit_sha=sha)
+        if gitops.head(WORK_DIR) != base:  # the agent committed on its own; squash into one commit
+            gitops.git("reset", "-q", "--soft", base, cwd=WORK_DIR)
+        gitops.commit_all(f"#{t['id']} {t['title']}\n\n{summary[:3000]}\n\ntix run {run_id}", cwd=WORK_DIR)
+        gitops.remove_worktree(WORK_DIR)  # frees the branch for merging
+
+        files = gitops.changed_files(branch)
+        if not files:
+            gitops.delete_branch(branch)
+            log.write("Agent made no file changes.")
+            runs.supersede_older(conn, run)
+            finish(conn, run_id, "done", summary=summary, branch=None)
+            return True
+
+        protected = runs.protected_changes(files)
+        runs.supersede_older(conn, run)
+        if protected:
+            reason = "Changes protected files: " + ", ".join(protected)
+        elif AUTO_MERGE == "never":
+            reason = "Auto-merge is disabled (TIX_AUTO_MERGE=never)."
+        else:
+            finish(conn, run_id, "review", summary=summary)
+            merged, err = runs.merge_run(conn, run_id)
+            log.write("Checks passed; merged into the live checkout." if merged else f"Auto-merge failed:\n{err}")
+            return True
+        log.write(f"Checks passed; waiting for approval. {reason}")
+        finish(conn, run_id, "review", summary=summary, review_reason=reason)
+        return True
     except Exception:
         err = traceback.format_exc()
         log.write(err)
-        finish(conn, run_id, t["id"], "failed", error=err[-4000:])
+        finish(conn, run_id, "failed", error=err[-4000:])
+        return False
     finally:
+        gitops.remove_worktree(WORK_DIR)
         log.close()
         conn.close()
 
 
 def recover_interrupted(conn) -> None:
-    """Runs left 'running' by a crashed/stopped worker: fail them and stash leftovers."""
-    stale = conn.execute("SELECT id, ticket_id FROM runs WHERE status = 'running'").fetchall()
+    """Runs left 'running' by a crashed/stopped worker: fail them, drop their worktree."""
+    stale = conn.execute("SELECT id FROM runs WHERE status = 'running'").fetchall()
     for r in stale:
-        if gitops.is_dirty():
-            gitops.git("stash", "push", "-u", "-q", "-m", f"tix: interrupted run {r['id']}")
-        finish(conn, r["id"], r["ticket_id"], "failed", error="Worker stopped during this run; changes stashed.")
+        finish(conn, r["id"], "failed", error="Worker stopped during this run.")
+    if stale:
+        gitops.remove_worktree(WORK_DIR)
+
+
+def write_status(head: str | None) -> None:
+    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATUS_FILE.write_text(json.dumps({"mode": MODE, "pid": os.getpid(), "head": head, "since": time.time()}))
+
+
+def restart() -> None:
+    if MODE == "fallback":
+        sys.exit(0)  # run.sh then retries the current worker
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 def main() -> None:
     load_env()
+    start_head = gitops.head()
     conn = connect()
     migrate(conn)
     recover_interrupted(conn)
     conn.close()
-    print(f"[worker] ready (pid {os.getpid()}), polling for queued runs", flush=True)
+    if MODE == "normal" and not gitops.has_tag(gitops.GOOD_WORKER_TAG):
+        gitops.tag_good_worker(start_head)
+    write_status(start_head)
+    print(f"[worker] ready (pid {os.getpid()}, mode {MODE}, work dir {WORK_DIR})", flush=True)
     while True:
+        if gitops.head() != start_head:
+            print("[worker] live HEAD moved; restarting to pick up code changes", flush=True)
+            restart()
         conn = connect()
         row = conn.execute("SELECT id FROM runs WHERE status = 'queued' ORDER BY id LIMIT 1").fetchone()
         conn.close()
@@ -279,9 +358,11 @@ def main() -> None:
             time.sleep(POLL_SECONDS)
             continue
         print(f"[worker] processing run {row['id']}", flush=True)
-        process(row["id"])
-        print(f"[worker] run {row['id']} finished; restarting to pick up code changes", flush=True)
-        os.execv(sys.executable, [sys.executable, *sys.argv])
+        healthy = process(row["id"])
+        if healthy and MODE == "normal":
+            gitops.tag_good_worker(start_head)
+        print(f"[worker] run {row['id']} finished; restarting", flush=True)
+        restart()
 
 
 if __name__ == "__main__":
