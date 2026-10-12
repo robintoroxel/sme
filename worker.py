@@ -65,8 +65,11 @@ def load_env() -> None:
 def child_env() -> dict:
     """Environment for agent and checks: they must resolve paths inside the staging clone."""
     env = dict(os.environ)
-    for k in ("TIX_ROOT", "TIX_DB", "TIX_WORKER_MODE"):
+    for k in ("TIX_ROOT", "TIX_DB", "TIX_WORKER_MODE", "OLDPWD"):
         env.pop(k, None)
+    # opencode takes its working directory from $PWD, not from the process cwd; the inherited
+    # PWD points at the live checkout, which made the agent edit it directly.
+    env["PWD"] = str(WORK_DIR)
     return env
 
 
@@ -123,7 +126,7 @@ def cancel_requested(run_id: int) -> bool:
 
 def run_agent(prompt: str, model: str, session_id: str | None, log: RunLog, run_id: int):
     """Run opencode once in the staging clone. Returns (returncode, session_id, last_text, cancelled)."""
-    cmd = [OPENCODE, "run", "--format", "json", "--model", model, *EXTRA_ARGS]
+    cmd = [OPENCODE, "run", "--format", "json", "--model", model, "--dir", str(WORK_DIR), *EXTRA_ARGS]
     if session_id:
         cmd += ["--session", session_id]
     cmd.append(prompt)
