@@ -3,24 +3,78 @@
 Run statuses: queued, running, review (waiting for approval), done (merged or no
 changes), failed, cancelled, rejected, superseded (replaced by a later follow-up run).
 """
+import re
+import sys
+from pathlib import Path, PurePosixPath
+
 from . import gitops
 
 # Changes to these files always need human approval: they make up the agent's own
-# guardrails (worker, checks, rules, permissions, git/DB plumbing).
+# guardrails (worker, checks, rules, permissions, git/DB plumbing, dependencies).
 PROTECTED = (
     "worker.py",
     "smoke.py",
     "run.sh",
     "AGENTS.md",
     "opencode.json",
+    "app/__init__.py",  # runs on every `from app import ...` in the worker
     "app/db.py",
     "app/gitops.py",
     "app/runs.py",
+    "pyproject.toml",  # run.sh runs `uv sync`, so dependency changes install unreviewed
+    "uv.lock",
+    ".gitignore",  # e.g. dropping `.env` would get secrets auto-committed
+    ".gitattributes",
 )
+# Top-level modules shadow the standard library for worker.py, smoke.py and the checks
+# (the script dir / cwd comes first on sys.path), e.g. a `time.py` would run inside the worker.
+SHADOWING = set(sys.stdlib_module_names) | {"sitecustomize", "usercustomize"}
+
+MIGRATION_RE = re.compile(r"^(\d+)_[\w-]+\.sql$")
+ATTACH_RE = re.compile(r"\b(ATTACH|DETACH)\b", re.IGNORECASE)  # would reach other database files
 
 
 def protected_changes(files: list[str]) -> list[str]:
-    return [f for f in files if f in PROTECTED]
+    out = []
+    for f in files:
+        p = PurePosixPath(f)
+        if (
+            f in PROTECTED
+            or (len(p.parts) == 1 and p.suffix == ".py")  # any top-level module
+            or (len(p.parts) > 1 and p.parts[0] in SHADOWING)  # a top-level package like json/
+        ):
+            out.append(f)
+    return out
+
+
+def migration_problems(work_dir: Path, live_head: str) -> list[str]:
+    """Migrations in the live HEAD are already applied to the live DB: they must stay unchanged,
+    and new ones must be numbered after the highest of them."""
+    live = gitops.git("ls-tree", "--name-only", live_head, "app/migrations/", cwd=work_dir).stdout.split()
+    live = [PurePosixPath(f).name for f in live if f.endswith(".sql")]
+    problems = []
+    for name in live:
+        path = f"app/migrations/{name}"
+        if gitops.git("diff", "--quiet", live_head, "--", path, cwd=work_dir, check=False).returncode:
+            problems.append(f"{path} was modified or deleted; existing migrations must not change.")
+    top = max((int(m.group(1)) for n in live if (m := MIGRATION_RE.match(n))), default=0)
+    seen: dict[int, str] = {}
+    for f in sorted((work_dir / "app" / "migrations").glob("*.sql")):
+        if f.name in live:
+            continue
+        m = MIGRATION_RE.match(f.name)
+        if not m:
+            problems.append(f"app/migrations/{f.name}: name must look like NNN_description.sql.")
+            continue
+        n = int(m.group(1))
+        if n <= top:
+            problems.append(f"app/migrations/{f.name}: number must be higher than {top:03d}.")
+        if ATTACH_RE.search(f.read_text(encoding="utf-8", errors="replace")):
+            problems.append(f"app/migrations/{f.name}: ATTACH/DETACH is not allowed in migrations.")
+        if n in seen:
+            problems.append(f"app/migrations/{f.name}: number {n:03d} is also used by {seen[n]}.")
+        seen[n] = f.name
+    return problems
 
 
 def refresh_ticket_status(conn, ticket_id: int) -> None:

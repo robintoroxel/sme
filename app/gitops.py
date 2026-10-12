@@ -80,6 +80,9 @@ def create_staging(path: Path, branch: str, base_ref: str) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     git("clone", "-q", "--no-checkout", str(ROOT), str(path))
     git("checkout", "-q", "-B", branch, base, cwd=path)
+    # No remote back to the live repo: `git push origin ...` from the clone could otherwise
+    # overwrite review branches or tags. fetch_staging pulls by path and does not need it.
+    git("remote", "remove", "origin", cwd=path)
     (path / ".git" / "opencode").write_text(STAGING_PROJECT_ID)
     return base
 
@@ -99,7 +102,8 @@ def delete_branch(branch: str) -> None:
 
 def changed_files(branch: str) -> list[str]:
     """Files a branch changes relative to the live HEAD."""
-    out = git("diff", "--name-only", f"HEAD...{branch}").stdout
+    # --no-renames: a rename must list the old path too, or moving a protected file hides it
+    out = git("diff", "--name-only", "--no-renames", f"HEAD...{branch}").stdout
     return [line for line in out.splitlines() if line]
 
 

@@ -34,6 +34,10 @@ protected files (see below). You can experiment freely, but only files in this c
 - Do not run `git commit`, `git reset`, `git checkout` or `git push`; the worker handles git.
 - Do not read or print `.env` (it holds secrets), and do not touch anything outside this directory.
 - Keep the style consistent: plain functions, short modules, server-rendered templates, CSS variables in `style.css`.
-- **Protected files** (`worker.py`, `smoke.py`, `run.sh`, `AGENTS.md`, `opencode.json`, `app/db.py`,
-  `app/gitops.py`, `app/runs.py`) may be changed when the ticket needs it, but every such change waits
-  for human approval. Do not weaken checks or permissions to get a change through.
+- **Protected files** (`worker.py`, `smoke.py`, `run.sh`, `AGENTS.md`, `opencode.json`, `app/__init__.py`,
+  `app/db.py`, `app/gitops.py`, `app/runs.py`, `pyproject.toml`, `uv.lock`, `.gitignore`, `.gitattributes`,
+  and any new top-level `.py` file) may be changed when the ticket needs it, but every such change waits
+  for human approval (see `PROTECTED` in `app/runs.py`). Do not weaken checks or permissions to get a change through.
+- The worker enforces some of these rules itself: the run fails if an existing migration changes, a new one
+  is misnumbered or uses `ATTACH`, or applying your migrations to a copy of the live DB loses rows.
+  Your environment only contains allowlisted variables, and the clone has no git remote.

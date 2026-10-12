@@ -14,9 +14,12 @@ changes to its own code take effect. run.sh falls back to the last known-good wo
 """
 import json
 import os
+import re
 import signal
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -35,6 +38,15 @@ FIX_ATTEMPTS = int(os.environ.get("TIX_FIX_ATTEMPTS", "2"))
 AUTO_MERGE = os.environ.get("TIX_AUTO_MERGE", "safe")  # safe: unless protected files change | never
 MODE = os.environ.get("TIX_WORKER_MODE", "normal")  # normal | fallback (set by run.sh)
 POLL_SECONDS = 2
+# Only these variables reach the agent and the checks; everything else (notably what
+# load_env() read from .env) stays in the worker. Extra names: TIX_AGENT_ENV=A,B.
+ENV_ALLOW = {
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
+    "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+    "UV_CACHE_DIR", "UV_LINK_MODE", "UV_PYTHON", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+}
+ENV_ALLOW_PREFIXES = ("OPENCODE_",)
 
 PREAMBLE = """You are the autonomous developer of "tix", the ticket system in the current
 repository. A user filed the ticket below in tix itself. Implement it completely in this
@@ -62,14 +74,31 @@ def load_env() -> None:
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-def child_env() -> dict:
-    """Environment for agent and checks: they must resolve paths inside the staging clone."""
-    env = dict(os.environ)
-    for k in ("TIX_ROOT", "TIX_DB", "TIX_WORKER_MODE", "OLDPWD"):
-        env.pop(k, None)
+def base_env() -> dict:
+    """Environment for agent and checks: allowlisted only, paths inside the staging clone."""
+    env = {k: v for k, v in os.environ.items() if k in ENV_ALLOW or k.startswith(ENV_ALLOW_PREFIXES)}
     # opencode takes its working directory from $PWD, not from the process cwd; the inherited
     # PWD points at the live checkout, which made the agent edit it directly.
     env["PWD"] = str(WORK_DIR)
+    # run.sh points UV_PROJECT_ENVIRONMENT at the live venv; `uv add`/`uv sync` in the clone
+    # must not change the venv the live app runs from.
+    env["UV_PROJECT_ENVIRONMENT"] = str(WORK_DIR / ".venv")
+    return env
+
+
+def agent_secrets() -> set[str]:
+    """Variables opencode needs: those the *live* opencode.json references (the clone's copy is
+    agent-editable), plus TIX_AGENT_ENV."""
+    names = set(filter(None, (n.strip() for n in os.environ.get("TIX_AGENT_ENV", "").split(","))))
+    cfg = ROOT / "opencode.json"
+    if cfg.exists():
+        names |= set(re.findall(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}", cfg.read_text(encoding="utf-8")))
+    return names
+
+
+def agent_env() -> dict:
+    env = base_env()
+    env.update({k: os.environ[k] for k in agent_secrets() if k in os.environ})
     return env
 
 
@@ -133,7 +162,7 @@ def run_agent(prompt: str, model: str, session_id: str | None, log: RunLog, run_
     log.write(f"$ opencode run --model {model}" + (f" --session {session_id}" if session_id else ""))
 
     proc = subprocess.Popen(
-        cmd, cwd=WORK_DIR, env=child_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        cmd, cwd=WORK_DIR, env=agent_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
         start_new_session=True,
     )
@@ -175,13 +204,46 @@ def run_agent(prompt: str, model: str, session_id: str | None, log: RunLog, run_
     return proc.returncode, state["session"], state["last_text"], cancelled
 
 
-def run_checks(log: RunLog) -> tuple[bool, str]:
+def check_migrations(live_head: str) -> tuple[bool, str]:
+    problems = runs.migration_problems(WORK_DIR, live_head)
+    return not problems, "\n".join(problems)
+
+
+def check_data_kept() -> tuple[bool, str]:
+    """Apply the clone's migrations to a fresh copy of the live DB; no table may vanish or shrink."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "tickets.db"
+        copy_db(db_path(), path)
+        conn = connect(path)
+        try:
+            def counts():
+                tables = [r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")]
+                return {t: conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0] for t in tables}
+            before = counts()
+            try:
+                migrate(conn, WORK_DIR / "app" / "migrations")
+            except sqlite3.Error as e:
+                return False, f"applying migrations to a copy of the live DB failed: {e}"
+            after = counts()
+        finally:
+            conn.close()
+    lost = [f"table {t}: {n} rows before, {after[t] if t in after else 'table gone'} after"
+            for t, n in before.items() if after.get(t, -1) < n]
+    return not lost, "Migrations lost existing data:\n" + "\n".join(lost) if lost else ""
+
+
+def run_checks(log: RunLog, live_head: str) -> tuple[bool, str]:
     """Checks defined here (not in the agent-editable smoke.py alone) gate every change."""
-    for name, cmd in CHECKS:
+    checks = [("migrations", lambda: check_migrations(live_head)), *CHECKS, ("data", check_data_kept)]
+    for name, cmd in checks:
         log.write(f"$ check: {name}")
         try:
-            r = subprocess.run(cmd, cwd=WORK_DIR, env=child_env(), capture_output=True, text=True, timeout=180)
-            out, ok = (r.stdout + r.stderr).strip(), r.returncode == 0
+            if callable(cmd):
+                ok, out = cmd()
+            else:
+                r = subprocess.run(cmd, cwd=WORK_DIR, env=base_env(), capture_output=True, text=True, timeout=180)
+                out, ok = (r.stdout + r.stderr).strip(), r.returncode == 0
         except subprocess.TimeoutExpired:
             out, ok = f"check '{name}' timed out after 180s", False
         if out:
@@ -251,6 +313,7 @@ def process(run_id: int) -> bool:
             (t["id"],),
         ).fetchone()
         base_ref = pending["branch"] if pending and gitops.branch_exists(pending["branch"]) else "HEAD"
+        live_head = gitops.head()
         base = gitops.create_staging(WORK_DIR, branch, base_ref)
         copy_db(db_path(), WORK_DIR / "data" / "tickets.db")
         log.write(f"Staging clone {WORK_DIR} on {branch} (from {base_ref}, {base[:10]}) with a copy of the DB.")
@@ -274,21 +337,22 @@ def process(run_id: int) -> bool:
                 finish(conn, run_id, "failed", error=f"opencode exited with code {rc}; see log.")
             return True
 
-        ok, out = run_checks(log)
+        ok, out = run_checks(log, live_head)
         for attempt in range(FIX_ATTEMPTS):
             if ok:
                 break
             log.write(f"-- asking agent to fix the failing check (attempt {attempt + 1}/{FIX_ATTEMPTS})")
             fix_prompt = (
                 "After your change, a required check fails:\n\n"
-                f"{out[-6000:]}\n\nFix the problem so all checks (compile, import, `python smoke.py`) pass, "
+                f"{out[-6000:]}\n\nFix the problem so all checks (compile, import, `python smoke.py`, "
+                "migration rules, no lost data) pass, "
                 "without dropping the ticket's goal."
             )
             rc, sid, s2, cancelled = run_agent(fix_prompt, t["model"], sid, log, run_id)
             summary = s2 or summary
             if cancelled or rc != 0:
                 break
-            ok, out = run_checks(log)
+            ok, out = run_checks(log, live_head)
 
         if live_checkout_touched(run_id, log):
             keep_attempt(base, branch, f"tix run {run_id} (ticket #{t['id']}): wrote to live checkout", log)
