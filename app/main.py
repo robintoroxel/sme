@@ -114,6 +114,24 @@ def index(request: Request, status: str | None = None):
     )
 
 
+@app.get("/overview", response_class=HTMLResponse)
+def overview(request: Request):
+    conn = db()
+    counts = dict(conn.execute("SELECT status, COUNT(*) FROM tickets GROUP BY status").fetchall())
+    total = conn.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
+    conn.close()
+    return templates.TemplateResponse(
+        request,
+        "overview.html",
+        {"counts": counts, "total": total, "statuses": STATUSES, "worker": worker_status()},
+    )
+
+
+@app.get("/about", response_class=HTMLResponse)
+def about(request: Request):
+    return templates.TemplateResponse(request, "about.html", {})
+
+
 @app.post("/tickets")
 def create_ticket(
     title: str = Form(...),

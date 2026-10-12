@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Overview · tix{% endblock %}
+{% block content %}
+<h2>Overview</h2>
+<section class="row hubs">
+  <a class="card hub" href="/">
+    <h3>Tickets</h3>
+    <p class="muted">{{ total }} ticket{{ 's' if total != 1 }}</p>
+  </a>
+  <a class="card hub" href="/about">
+    <h3>About</h3>
+    <p class="muted">What tix is and how it works</p>
+  </a>
+</section>
+<section class="card">
+  <h3>Tickets by status</h3>
+  <div class="row">
+    {% for s in statuses %}
+      <span class="badge {{ s }}">{{ s }} {{ counts.get(s, 0) }}</span>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}
