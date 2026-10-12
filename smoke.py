@@ -59,8 +59,11 @@ with TestClient(app) as c:  # entering runs the lifespan, i.e. the migrations
     conn.close()
     assert prio == 3, f"prio should be stored as 3, got {prio}"
 
-    body = c.get("/").text
-    assert "Impl" in body, "overview list should include an Impl column"
-    assert "1m 30s" in body, f"overview should show formatted implementation time, got:\n{body}"
+    overview = c.get("/").text
+    assert "Tickets by status" in overview, "landing page should be the overview"
+
+    body = c.get("/tickets").text
+    assert "Impl" in body, "ticket list should include an Impl column"
+    assert "1m 30s" in body, f"ticket list should show formatted implementation time, got:\n{body}"
 
 print(f"smoke OK ({len(ids)} ticket pages checked)")

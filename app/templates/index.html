@@ -40,9 +40,9 @@
 
 <section>
   <nav class="filters">
-    <a href="/" class="{{ 'active' if not status }}">all</a>
+    <a href="/tickets" class="{{ 'active' if not status }}">all</a>
     {% for s in statuses %}
-      <a href="/?status={{ s }}" class="{{ 'active' if status == s }}">{{ s }} <small>{{ counts.get(s, 0) }}</small></a>
+      <a href="/tickets?status={{ s }}" class="{{ 'active' if status == s }}">{{ s }} <small>{{ counts.get(s, 0) }}</small></a>
     {% endfor %}
   </nav>
   <div class="tickets-wrap">

@@ -80,8 +80,8 @@ def healthz():
     return {"ok": True}
 
 
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request, status: str | None = None):
+@app.get("/tickets", response_class=HTMLResponse)
+def tickets(request: Request, status: str | None = None):
     conn = db()
     q = (
         "SELECT t.*,"
@@ -114,7 +114,7 @@ def index(request: Request, status: str | None = None):
     )
 
 
-@app.get("/overview", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 def overview(request: Request):
     conn = db()
     counts = dict(conn.execute("SELECT status, COUNT(*) FROM tickets GROUP BY status").fetchall())
@@ -125,6 +125,11 @@ def overview(request: Request):
         "overview.html",
         {"counts": counts, "total": total, "statuses": STATUSES, "worker": worker_status()},
     )
+
+
+@app.get("/overview")
+def overview_redirect():
+    return see_other("/")
 
 
 @app.get("/about", response_class=HTMLResponse)
