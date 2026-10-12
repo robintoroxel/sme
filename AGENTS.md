@@ -41,3 +41,5 @@ protected files (see below). You can experiment freely, but only files in this c
 - The worker enforces some of these rules itself: the run fails if an existing migration changes, a new one
   is misnumbered or uses `ATTACH`, or applying your migrations to a copy of the live DB loses rows.
   Your environment only contains allowlisted variables, and the clone has no git remote.
+- You run in a sandbox: you can write only inside this clone (not `.git`) and `/tmp`, the live checkout is
+  not visible, and the network reaches only the model API, npm and PyPI. Failures there are expected; don't work around them.

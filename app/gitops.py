@@ -84,7 +84,21 @@ def create_staging(path: Path, branch: str, base_ref: str) -> str:
     # overwrite review branches or tags. fetch_staging pulls by path and does not need it.
     git("remote", "remove", "origin", cwd=path)
     (path / ".git" / "opencode").write_text(STAGING_PROJECT_ID)
+    shutil.copyfile(path / ".git" / "config", path / ".git" / "config.tix")
+    sanitize_staging(path)
     return base
+
+
+def sanitize_staging(path: Path) -> None:
+    """The worker runs git in the clone after the agent did. The sandbox keeps .git read-only;
+    without it (TIX_SANDBOX=off), drop anything that would make those git calls run agent code
+    or act on another repository."""
+    gitdir = path / ".git"
+    shutil.copyfile(gitdir / "config.tix", gitdir / "config")
+    shutil.rmtree(gitdir / "hooks", ignore_errors=True)
+    (gitdir / "hooks").mkdir()
+    for f in ("commondir", "objects/info/alternates", "info/attributes"):
+        (gitdir / f).unlink(missing_ok=True)
 
 
 def fetch_staging(path: Path, branch: str) -> None:
