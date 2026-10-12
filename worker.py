@@ -173,10 +173,12 @@ def discard(base: str, label: str, log: RunLog) -> None:
 
 def finish(conn, run_id: int, ticket_id: int, status: str, **fields) -> None:
     sets = ", ".join(f"{k} = ?" for k in fields)
-    conn.execute(
-        f"UPDATE runs SET status = ?, finished_at = datetime('now'){', ' + sets if sets else ''} WHERE id = ?",
-        (status, *fields.values(), run_id),
+    sql = (
+        "UPDATE runs SET status = ?, finished_at = datetime('now'),"
+        " duration_seconds = CAST((julianday('now') - julianday(started_at)) * 86400 AS INTEGER)"
+        f"{', ' + sets if sets else ''} WHERE id = ?"
     )
+    conn.execute(sql, (status, *fields.values(), run_id))
     # A cancelled run only cancels the ticket if nothing else is pending for it.
     pending = conn.execute(
         "SELECT 1 FROM runs WHERE ticket_id = ? AND status = 'queued'", (ticket_id,)

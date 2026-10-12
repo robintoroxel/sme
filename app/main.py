@@ -28,7 +28,23 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="tix", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
+
+
+def fmt_duration(seconds) -> str:
+    if seconds is None:
+        return "—"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
 templates = Jinja2Templates(directory=APP_DIR / "templates")
+templates.env.filters["duration"] = fmt_duration
 
 
 def db():
@@ -59,12 +75,17 @@ def healthz():
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, status: str | None = None):
     conn = db()
-    q = "SELECT * FROM tickets"
+    q = (
+        "SELECT t.*,"
+        " (SELECT SUM(r.duration_seconds) FROM runs r"
+        " WHERE r.ticket_id = t.id AND r.status = 'done') AS impl_seconds"
+        " FROM tickets t"
+    )
     args: tuple = ()
     if status in STATUSES:
-        q += " WHERE status = ?"
+        q += " WHERE t.status = ?"
         args = (status,)
-    tickets = conn.execute(q + " ORDER BY id DESC", args).fetchall()
+    tickets = conn.execute(q + " ORDER BY t.id DESC", args).fetchall()
     counts = dict(conn.execute("SELECT status, COUNT(*) FROM tickets GROUP BY status").fetchall())
     conn.close()
     return templates.TemplateResponse(

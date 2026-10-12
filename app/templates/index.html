@@ -29,7 +29,7 @@
     {% endfor %}
   </nav>
   <table class="tickets">
-    <thead><tr><th>#</th><th>Title</th><th>Prio</th><th>Status</th><th>Model</th><th>Updated</th></tr></thead>
+    <thead><tr><th>#</th><th>Title</th><th>Prio</th><th>Status</th><th>Model</th><th>Impl</th><th>Updated</th></tr></thead>
     <tbody>
       {% for t in tickets %}
       <tr>
@@ -38,10 +38,11 @@
         <td><span class="badge prio-{{ t.prio }}">{{ prios.get(t.prio, t.prio) }}</span></td>
         <td><span class="badge {{ t.status }}">{{ t.status }}</span></td>
         <td class="muted">{{ t.model.split('/')[-1] }}</td>
+        <td class="muted">{{ t.impl_seconds|duration }}</td>
         <td class="muted">{{ t.updated_at }}</td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="muted">No tickets yet.</td></tr>
+      <tr><td colspan="7" class="muted">No tickets yet.</td></tr>
       {% endfor %}
     </tbody>
   </table>

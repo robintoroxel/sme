@@ -79,5 +79,6 @@ pre.log {
 .summary { border-left: 3px solid var(--accent); padding-left: 10px; margin: 8px 0; }
 @media (max-width: 600px) {
   .tickets th:nth-child(4), .tickets td:nth-child(4),
-  .tickets th:nth-child(5), .tickets td:nth-child(5) { display: none; }
+  .tickets th:nth-child(5), .tickets td:nth-child(5),
+  .tickets th:nth-child(6), .tickets td:nth-child(6) { display: none; }
 }

@@ -48,7 +48,19 @@ with TestClient(app) as c:  # entering runs the lifespan, i.e. the migrations
 
     conn = connect()
     prio = conn.execute("SELECT prio FROM tickets WHERE id = ?", (ids[0],)).fetchone()[0]
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)")]
+    assert "duration_seconds" in cols, "runs.duration_seconds column missing"
+    conn.execute(
+        "UPDATE runs SET status = 'done', started_at = datetime('now', '-90 seconds'),"
+        " finished_at = datetime('now'), duration_seconds = 90 WHERE ticket_id = ?",
+        (ids[0],),
+    )
+    conn.commit()
     conn.close()
     assert prio == 3, f"prio should be stored as 3, got {prio}"
+
+    body = c.get("/").text
+    assert "Impl" in body, "overview list should include an Impl column"
+    assert "1m 30s" in body, f"overview should show formatted implementation time, got:\n{body}"
 
 print(f"smoke OK ({len(ids)} ticket pages checked)")
