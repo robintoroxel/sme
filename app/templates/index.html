@@ -10,10 +10,17 @@
   {% for o in orphans %}<code>{{ o }}</code>{{ ', ' if not loop.last }}{% endfor %}.
   Their schema changes are still in the live database.</div>
 {% endif %}
-<section class="card">
-  <h2>New ticket</h2>
+<section class="toolbar">
+  <button type="button" id="new-ticket-btn">+ New ticket</button>
+</section>
+
+<dialog id="new-ticket-modal">
   <form method="post" action="/tickets" class="stack">
-    <input name="title" placeholder="Title, e.g. “Add a priority field to tickets”" required autofocus>
+    <div class="row spread">
+      <h2>New ticket</h2>
+      <button type="button" class="close" data-close aria-label="Close">×</button>
+    </div>
+    <input name="title" placeholder="Title, e.g. “Add a priority field to tickets”" required>
     <textarea name="description" rows="6" placeholder="Describe the change for the agent: UI, DB schema, behaviour…"></textarea>
     <div class="row">
       <label>Model
@@ -29,7 +36,7 @@
       <button type="submit">Create &amp; hand to agent</button>
     </div>
   </form>
-</section>
+</dialog>
 
 <section>
   <nav class="filters">
@@ -38,25 +45,37 @@
       <a href="/?status={{ s }}" class="{{ 'active' if status == s }}">{{ s }} <small>{{ counts.get(s, 0) }}</small></a>
     {% endfor %}
   </nav>
-  <table class="tickets">
-    <thead><tr><th>#</th><th>Title</th><th>Prio</th><th>Status</th><th>Model</th><th>Impl</th><th>Updated</th></tr></thead>
-    <tbody>
-      {% for t in tickets %}
-      <tr>
-        <td>{{ t.id }}</td>
-        <td><a href="/tickets/{{ t.id }}">{{ t.title }}</a></td>
-        <td><span class="badge prio-{{ t.prio }}">{{ prios.get(t.prio, t.prio) }}</span></td>
-        <td><span class="badge {{ t.status }}">{{ t.status }}</span></td>
-        <td class="muted">{{ t.model.split('/')[-1] }}</td>
-        <td class="muted">{{ t.impl_seconds|duration }}</td>
-        <td class="muted">{{ t.updated_at }}</td>
-      </tr>
-      {% else %}
-      <tr><td colspan="7" class="muted">No tickets yet.</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="tickets-wrap">
+    <table class="tickets">
+      <thead><tr><th>#</th><th>Title</th><th>Prio</th><th>Status</th><th>Model</th><th>Impl</th><th>Updated</th></tr></thead>
+      <tbody>
+        {% for t in tickets %}
+        <tr>
+          <td>{{ t.id }}</td>
+          <td><a href="/tickets/{{ t.id }}">{{ t.title }}</a></td>
+          <td><span class="badge prio-{{ t.prio }}">{{ prios.get(t.prio, t.prio) }}</span></td>
+          <td><span class="badge {{ t.status }}">{{ t.status }}</span></td>
+          <td class="muted">{{ t.model.split('/')[-1] }}</td>
+          <td class="muted">{{ t.impl_seconds|duration }}</td>
+          <td class="muted">{{ t.updated_at }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="muted">No tickets yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>
+<script>
+  const modal = document.getElementById('new-ticket-modal');
+  const openBtn = document.getElementById('new-ticket-btn');
+  openBtn.addEventListener('click', () => {
+    modal.showModal();
+    modal.querySelector('input[name="title"]').focus();
+  });
+  modal.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => modal.close()));
+  modal.addEventListener('click', (e) => { if (e.target === modal) modal.close(); });
+</script>
 {% if counts.get('queued') or counts.get('running') %}
 <script>setTimeout(() => location.reload(), 5000)</script>
 {% endif %}

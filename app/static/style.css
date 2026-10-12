@@ -58,8 +58,23 @@ button.danger { background: var(--danger); }
 .filters { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
 .filters a { text-decoration: none; color: var(--muted); }
 .filters a.active { color: var(--text); font-weight: 600; }
-table.tickets { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); }
+.toolbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+.tickets-wrap {
+  background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08); overflow: hidden;
+}
+table.tickets { width: 100%; border-collapse: collapse; background: transparent; border: 0; }
+.tickets thead th { background: var(--bg); }
 .tickets th, .tickets td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.tickets tbody tr:last-child td { border-bottom: 0; }
+dialog {
+  border: 1px solid var(--border); border-radius: 10px; padding: 0; width: min(560px, 94vw);
+  background: var(--card); color: var(--text);
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+dialog form { padding: 20px; }
+dialog h2 { margin: 0; }
+dialog .close { background: transparent; color: var(--muted); padding: 4px 10px; font-size: 18px; line-height: 1; }
 .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--border); white-space: nowrap; }
 .badge.queued { background: #e7f5ff; color: #1864ab; }
 .badge.running { background: #fff3bf; color: #8a6100; }
