@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card">
+  <h2>New ticket</h2>
+  <form method="post" action="/tickets" class="stack">
+    <input name="title" placeholder="Title, e.g. “Add a priority field to tickets”" required autofocus>
+    <textarea name="description" rows="6" placeholder="Describe the change for the agent: UI, DB schema, behaviour…"></textarea>
+    <div class="row">
+      <label>Model
+        <select name="model">
+          {% for m in models %}<option value="{{ m }}">{{ m }}</option>{% endfor %}
+        </select>
+      </label>
+      <button type="submit">Create &amp; hand to agent</button>
+    </div>
+  </form>
+</section>
+
+<section>
+  <nav class="filters">
+    <a href="/" class="{{ 'active' if not status }}">all</a>
+    {% for s in statuses %}
+      <a href="/?status={{ s }}" class="{{ 'active' if status == s }}">{{ s }} <small>{{ counts.get(s, 0) }}</small></a>
+    {% endfor %}
+  </nav>
+  <table class="tickets">
+    <thead><tr><th>#</th><th>Title</th><th>Status</th><th>Model</th><th>Updated</th></tr></thead>
+    <tbody>
+      {% for t in tickets %}
+      <tr>
+        <td>{{ t.id }}</td>
+        <td><a href="/tickets/{{ t.id }}">{{ t.title }}</a></td>
+        <td><span class="badge {{ t.status }}">{{ t.status }}</span></td>
+        <td class="muted">{{ t.model.split('/')[-1] }}</td>
+        <td class="muted">{{ t.updated_at }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="muted">No tickets yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% if counts.get('queued') or counts.get('running') %}
+<script>setTimeout(() => location.reload(), 5000)</script>
+{% endif %}
+{% endblock %}

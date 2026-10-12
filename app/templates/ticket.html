@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}#{{ t.id }} {{ t.title }} · tix{% endblock %}
+{% block content %}
+<p><a href="/">&larr; all tickets</a></p>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+
+<section class="card">
+  <div class="row spread">
+    <h2>#{{ t.id }} {{ t.title }}</h2>
+    <span class="badge {{ t.status }}" id="ticket-status">{{ t.status }}</span>
+  </div>
+  <p class="muted">{{ t.model }} · created {{ t.created_at }}{% if t.session_id %} · session <code>{{ t.session_id }}</code>{% endif %}</p>
+  {% if t.description %}<pre class="desc">{{ t.description }}</pre>{% endif %}
+  <div class="row">
+    {% if active %}
+      <form method="post" action="/tickets/{{ t.id }}/cancel"><button class="secondary">Cancel</button></form>
+    {% endif %}
+    {% if not active and t.status != 'reverted' and runs|selectattr('commit_sha')|list %}
+      <form method="post" action="/tickets/{{ t.id }}/revert"
+            onsubmit="return confirm('Revert all commits made for this ticket?')">
+        <button class="danger">Revert changes</button>
+      </form>
+    {% endif %}
+  </div>
+</section>
+
+{% for r in runs %}
+<section class="card run" data-run="{{ r.id }}" data-status="{{ r.status }}">
+  <div class="row spread">
+    <h3>Run {{ loop.index }}</h3>
+    <span class="badge {{ r.status }}">{{ r.status }}</span>
+  </div>
+  <details {% if loop.index > 1 %}open{% endif %}><summary>Prompt</summary><pre>{{ r.prompt }}</pre></details>
+  {% if r.summary %}<div class="summary"><strong>Agent summary</strong><pre>{{ r.summary }}</pre></div>{% endif %}
+  {% if r.error %}<div class="error"><pre>{{ r.error }}</pre></div>{% endif %}
+  {% if r.commit_sha %}<p>Commit <a href="/runs/{{ r.id }}/diff"><code>{{ r.commit_sha[:10] }}</code></a> (view diff)</p>{% endif %}
+  <details {% if r.status in ('queued', 'running') %}open{% endif %}>
+    <summary>Agent log</summary>
+    <pre class="log" id="log-{{ r.id }}">{{ logs[r.id] }}</pre>
+  </details>
+</section>
+{% endfor %}
+
+<section class="card">
+  <h3>Follow-up</h3>
+  <form method="post" action="/tickets/{{ t.id }}/followup" class="stack">
+    <textarea name="body" rows="4" placeholder="Ask the agent for changes; it continues the same session."></textarea>
+    <div class="row"><button type="submit">Send to agent</button></div>
+  </form>
+</section>
+
+{% if active %}
+<script>
+  // Live-update logs of active runs; reload the page once everything has settled.
+  async function poll() {
+    const res = await fetch('/api/tickets/{{ t.id }}');
+    const data = await res.json();
+    for (const el of document.querySelectorAll('.run')) {
+      const st = el.dataset.status;
+      if (st === 'queued' || st === 'running') {
+        const log = await (await fetch(`/runs/${el.dataset.run}/log`)).text();
+        const pre = document.getElementById(`log-${el.dataset.run}`);
+        const atBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+        pre.textContent = log;
+        if (atBottom) pre.scrollTop = pre.scrollHeight;
+      }
+    }
+    const changed = data.runs.some(r => {
+      const el = document.querySelector(`.run[data-run="${r.id}"]`);
+      return !el || el.dataset.status !== r.status;
+    });
+    if (changed) location.reload(); else setTimeout(poll, 2000);
+  }
+  setTimeout(poll, 1000);
+</script>
+{% endif %}
+{% endblock %}
