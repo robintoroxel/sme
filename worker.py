@@ -2,7 +2,7 @@
 
 The agent never touches the live checkout. For each run:
   1. commit any manual (uncommitted) changes in the live checkout
-  2. create a staging worktree (TIX_WORK_DIR) on branch tix/run-N with a copy of the live DB
+  2. create a staging clone (TIX_WORK_DIR) on branch tix/run-N with a copy of the live DB
      (a follow-up on a ticket that is awaiting review builds on that review branch)
   3. run `opencode run` there (follow-ups continue the session)
   4. run the checks (compile, import, smoke.py); on failure let the agent fix it, FIX_ATTEMPTS times
@@ -63,7 +63,7 @@ def load_env() -> None:
 
 
 def child_env() -> dict:
-    """Environment for agent and checks: they must resolve paths inside the worktree."""
+    """Environment for agent and checks: they must resolve paths inside the staging clone."""
     env = dict(os.environ)
     for k in ("TIX_ROOT", "TIX_DB", "TIX_WORKER_MODE"):
         env.pop(k, None)
@@ -122,7 +122,7 @@ def cancel_requested(run_id: int) -> bool:
 
 
 def run_agent(prompt: str, model: str, session_id: str | None, log: RunLog, run_id: int):
-    """Run opencode once in the worktree. Returns (returncode, session_id, last_text, cancelled)."""
+    """Run opencode once in the staging clone. Returns (returncode, session_id, last_text, cancelled)."""
     cmd = [OPENCODE, "run", "--format", "json", "--model", model, *EXTRA_ARGS]
     if session_id:
         cmd += ["--session", session_id]
@@ -203,12 +203,26 @@ def finish(conn, run_id: int, status: str, **fields) -> None:
     conn.commit()
 
 
-def keep_attempt(base: str, message: str, log: RunLog) -> None:
+def keep_attempt(base: str, branch: str, message: str, log: RunLog) -> None:
     """Commit a failed/cancelled attempt on its branch so the diff stays inspectable."""
     if gitops.head(WORK_DIR) != base:
         gitops.git("reset", "-q", "--soft", base, cwd=WORK_DIR)
     if gitops.commit_all(message, cwd=WORK_DIR):
+        gitops.fetch_staging(WORK_DIR, branch)
         log.write("Attempt kept on its branch (not merged); see the diff link.")
+
+
+def live_checkout_touched(run_id: int, log: RunLog) -> bool:
+    """Guard: the agent must only write to the staging clone. Stash anything that leaked."""
+    if not gitops.is_dirty():
+        return False
+    with gitops.repo_lock():
+        gitops.git("stash", "push", "-u", "-q", "-m", f"tix: live checkout changed during run {run_id}")
+    log.write(
+        "!! The live checkout changed during this run (the agent wrote outside its staging clone, "
+        "or someone edited files by hand). Those changes were moved to `git stash`; nothing was merged."
+    )
+    return True
 
 
 def process(run_id: int) -> bool:
@@ -234,10 +248,9 @@ def process(run_id: int) -> bool:
             (t["id"],),
         ).fetchone()
         base_ref = pending["branch"] if pending and gitops.branch_exists(pending["branch"]) else "HEAD"
-        gitops.create_worktree(WORK_DIR, branch, base_ref)
-        base = gitops.head(WORK_DIR)
+        base = gitops.create_staging(WORK_DIR, branch, base_ref)
         copy_db(db_path(), WORK_DIR / "data" / "tickets.db")
-        log.write(f"Staging worktree {WORK_DIR} on {branch} (from {base_ref}, {base[:10]}) with a copy of the DB.")
+        log.write(f"Staging clone {WORK_DIR} on {branch} (from {base_ref}, {base[:10]}) with a copy of the DB.")
 
         first = t["session_id"] is None
         prompt = PREAMBLE + run["prompt"] if first else (
@@ -250,7 +263,8 @@ def process(run_id: int) -> bool:
             conn.commit()
 
         if cancelled or rc != 0:
-            keep_attempt(base, f"tix run {run_id} (ticket #{t['id']}): unfinished attempt", log)
+            live_checkout_touched(run_id, log)
+            keep_attempt(base, branch, f"tix run {run_id} (ticket #{t['id']}): unfinished attempt", log)
             if cancelled:
                 finish(conn, run_id, "cancelled", error="Cancelled or timed out.")
             else:
@@ -273,15 +287,21 @@ def process(run_id: int) -> bool:
                 break
             ok, out = run_checks(log)
 
+        if live_checkout_touched(run_id, log):
+            keep_attempt(base, branch, f"tix run {run_id} (ticket #{t['id']}): wrote to live checkout", log)
+            finish(conn, run_id, "failed", summary=summary,
+                   error="The live checkout changed during the run; those changes were stashed (see log).")
+            return True
+
         if not ok:
-            keep_attempt(base, f"tix run {run_id} (ticket #{t['id']}): failed checks", log)
+            keep_attempt(base, branch, f"tix run {run_id} (ticket #{t['id']}): failed checks", log)
             finish(conn, run_id, "failed", summary=summary, error="Checks failed:\n" + out[-4000:])
             return True
 
         if gitops.head(WORK_DIR) != base:  # the agent committed on its own; squash into one commit
             gitops.git("reset", "-q", "--soft", base, cwd=WORK_DIR)
         gitops.commit_all(f"#{t['id']} {t['title']}\n\n{summary[:3000]}\n\ntix run {run_id}", cwd=WORK_DIR)
-        gitops.remove_worktree(WORK_DIR)  # frees the branch for merging
+        gitops.fetch_staging(WORK_DIR, branch)
 
         files = gitops.changed_files(branch)
         if not files:
@@ -311,18 +331,18 @@ def process(run_id: int) -> bool:
         finish(conn, run_id, "failed", error=err[-4000:])
         return False
     finally:
-        gitops.remove_worktree(WORK_DIR)
+        gitops.remove_staging(WORK_DIR)
         log.close()
         conn.close()
 
 
 def recover_interrupted(conn) -> None:
-    """Runs left 'running' by a crashed/stopped worker: fail them, drop their worktree."""
+    """Runs left 'running' by a crashed/stopped worker: fail them, drop the staging clone."""
     stale = conn.execute("SELECT id FROM runs WHERE status = 'running'").fetchall()
     for r in stale:
         finish(conn, r["id"], "failed", error="Worker stopped during this run.")
     if stale:
-        gitops.remove_worktree(WORK_DIR)
+        gitops.remove_staging(WORK_DIR)
 
 
 def write_status(head: str | None) -> None:

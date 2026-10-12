@@ -4,11 +4,11 @@ tix is a small ticket system. Tickets filed in tix are implemented by an opencod
 which is how tix develops itself. You are probably that agent.
 
 ## Where you are working
-You work in a **staging worktree**: a separate checkout on branch `tix/run-N`, with a copy
+You work in a **staging clone**: a separate clone on branch `tix/run-N`, with a copy
 of the live database in `data/tickets.db`. The live app is not affected while you work.
 When you finish, the worker runs the checks (compile, import, `python smoke.py`). If they
 pass, your change is merged into the live app, or held for human approval when it touches
-protected files (see below). You can experiment freely, but only files in this worktree count.
+protected files (see below). You can experiment freely, but only files in this clone count.
 
 ## Layout
 - `app/main.py`: FastAPI routes (server-rendered HTML plus a tiny JSON API)

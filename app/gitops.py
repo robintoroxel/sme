@@ -1,8 +1,8 @@
 """Git helpers shared by the web app and the worker.
 
 The live checkout (ROOT) only ever receives finished, checked work: agents work in a
-separate worktree on a branch `tix/run-N`, which is squash-merged into the live
-branch when approved. All mutations of the live checkout go through repo_lock().
+separate staging clone on a branch `tix/run-N`, which is fetched back and squash-merged
+into the live branch when approved. All mutations of the live checkout go through repo_lock().
 """
 import contextlib
 import fcntl
@@ -61,18 +61,32 @@ def commit_manual_changes(reason: str) -> str | None:
     return None
 
 
-# --- worktrees and run branches -------------------------------------------------
+# --- staging clone and run branches ---------------------------------------------
+# Agents work in a separate *clone*, not a `git worktree`: opencode identifies projects by
+# the id cached in .git/opencode, and a worktree shares the live repo's .git, which made
+# opencode operate on the live checkout. The clone gets its own project id.
+STAGING_PROJECT_ID = "tix-staging"
 
-def remove_worktree(path: Path) -> None:
-    git("worktree", "remove", "--force", str(path), check=False)
+
+def remove_staging(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
     git("worktree", "prune", check=False)
 
 
-def create_worktree(path: Path, branch: str, base: str) -> None:
-    remove_worktree(path)
+def create_staging(path: Path, branch: str, base_ref: str) -> str:
+    """Fresh clone of the live repo at base_ref on a new branch. Returns the base sha."""
+    base = git("rev-parse", base_ref).stdout.strip()
+    remove_staging(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    git("worktree", "add", "-q", "-B", branch, str(path), base)
+    git("clone", "-q", "--no-checkout", str(ROOT), str(path))
+    git("checkout", "-q", "-B", branch, base, cwd=path)
+    (path / ".git" / "opencode").write_text(STAGING_PROJECT_ID)
+    return base
+
+
+def fetch_staging(path: Path, branch: str) -> None:
+    """Bring the staging branch into the live repo (as a branch, never checked out)."""
+    git("fetch", "-q", str(path), f"+refs/heads/{branch}:refs/heads/{branch}")
 
 
 def branch_exists(branch: str) -> bool:

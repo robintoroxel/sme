@@ -14,7 +14,8 @@ bash run.sh            # web UI on http://localhost:8000, plus the supervised ag
 
 ## How a ticket flows
 1. Each ticket, and each follow-up comment, becomes a **run**. `worker.py` handles runs one at a time.
-2. The agent works in a **staging worktree** (`~/.local/share/tix/work`, branch `tix/run-N`) with a
+2. The agent works in a **staging clone** (`~/.local/share/tix/work`, branch `tix/run-N`, with its own
+   `.git`, so opencode treats it as a separate project) and a
    copy of the live DB. The live app and DB are untouched while it works.
 3. Checks: compile, import, then `smoke.py`. If a check fails, the agent gets the error and up to 2 tries to fix it.
    If it still fails, the run fails and the attempt is kept on its branch, where you can view the diff.
@@ -25,7 +26,7 @@ bash run.sh            # web UI on http://localhost:8000, plus the supervised ag
 5. A follow-up on a ticket awaiting review builds on that unmerged branch. A merged ticket can be **reverted**.
 
 ## Self-reference safeguards
-- The agent never edits the live checkout, so a half-finished change can't take the app down or migrate the live DB.
+- The agent never edits the live checkout, so a half-finished change can't take the app down or migrate the live DB. If the live checkout changes during a run anyway, those changes are stashed and the run fails.
 - The worker defines its own checks, so the agent can't get around them by editing `smoke.py`.
 - The agent can't change its own guardrails without approval: edits to `worker.py`, `smoke.py`, `run.sh`,
   `AGENTS.md`, `opencode.json`, `app/db.py`, `app/gitops.py` and `app/runs.py` always need it.
