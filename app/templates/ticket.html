@@ -17,7 +17,7 @@
     {% endif %}
     {% if not active and t.status != 'reverted' and runs|selectattr('commit_sha')|list %}
       <form method="post" action="/tickets/{{ t.id }}/revert"
-            onsubmit="return confirm('Revert all commits made for this ticket?')">
+            onsubmit="return confirm('Revert all commits made for this ticket?\n\nNote: code and migration files are reverted, but schema changes already applied to the live database stay in place.')">
         <button class="danger">Revert changes</button>
       </form>
     {% endif %}

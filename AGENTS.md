@@ -11,13 +11,15 @@ working in this repository, which is how tix develops itself. You are probably t
 - `app/gitops.py`: git helpers used for commit/revert
 - `worker.py`: picks queued runs and invokes opencode (that is you)
 - `smoke.py`: post-change check; must pass or your change is rolled back
-- `data/`: live database and run logs (git-ignored). **Never edit or delete anything in `data/`.**
+- `data/`: live database and run logs (git-ignored). **Never write to or delete anything in `data/`.**
 
 ## Rules
 - **DB schema changes:** add a NEW migration file such as `app/migrations/002_add_priority.sql`.
   Never edit a migration that already exists, because it has already been applied to the live DB.
   SQLite has limited `ALTER TABLE`, so use `ALTER TABLE ... ADD COLUMN` or the create-copy-drop-rename pattern.
-  Keep existing data intact.
+  Keep existing data intact. Before writing a migration, look at the live schema (read-only), because
+  a reverted ticket can leave columns behind:
+  `uv run python -c "import sqlite3;[print(r[0]) for r in sqlite3.connect('data/tickets.db').execute('select sql from sqlite_master where sql is not null')]"`
 - The web server is already running with auto-reload, so do **not** start servers or long-running processes.
 - Verify your work with `python smoke.py` (run from the repo root inside the project venv: `uv run python smoke.py`).
   When you add a significant feature, extend `smoke.py` to cover it.
