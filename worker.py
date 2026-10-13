@@ -14,13 +14,18 @@ changes to its own code take effect. run.sh falls back to the last known-good wo
 """
 import json
 import os
+import re
+import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from pathlib import Path
+from urllib.parse import urlparse
 
 from app import gitops, runs
 from app.db import ROOT, connect, copy_db, db_path, migrate
@@ -35,6 +40,25 @@ FIX_ATTEMPTS = int(os.environ.get("TIX_FIX_ATTEMPTS", "2"))
 AUTO_MERGE = os.environ.get("TIX_AUTO_MERGE", "safe")  # safe: unless protected files change | never
 MODE = os.environ.get("TIX_WORKER_MODE", "normal")  # normal | fallback (set by run.sh)
 POLL_SECONDS = 2
+# Only these variables reach the agent and the checks; everything else (notably what
+# load_env() read from .env) stays in the worker. Extra names: TIX_AGENT_ENV=A,B.
+ENV_ALLOW = {
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
+    "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR",
+    "UV_CACHE_DIR", "UV_LINK_MODE", "UV_PYTHON", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+}
+ENV_ALLOW_PREFIXES = ("OPENCODE_",)
+
+# Agent and checks run inside Anthropic's sandbox-runtime (srt: bubblewrap + a domain-allowlist
+# proxy). Writes are limited to the staging clone and a few caches, the live checkout (code, DB,
+# .env) is unreadable, and only the model API and package registries are reachable.
+SANDBOX = os.environ.get("TIX_SANDBOX", "srt")  # srt | off
+SRT = os.environ.get("TIX_SRT", "srt")
+SANDBOX_DIR = WORK_DIR.parent / "sandbox"  # srt settings and the agent's caches; outside the clone
+DEFAULT_DOMAINS = ["models.dev", "registry.npmjs.org", "pypi.org", "files.pythonhosted.org"]
+SECRET_PATHS = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".netrc", ".git-credentials",
+                ".config/gh", ".config/gcloud", ".srt-settings.json"]
 
 PREAMBLE = """You are the autonomous developer of "tix", the ticket system in the current
 repository. A user filed the ticket below in tix itself. Implement it completely in this
@@ -62,15 +86,103 @@ def load_env() -> None:
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-def child_env() -> dict:
-    """Environment for agent and checks: they must resolve paths inside the staging clone."""
-    env = dict(os.environ)
-    for k in ("TIX_ROOT", "TIX_DB", "TIX_WORKER_MODE", "OLDPWD"):
-        env.pop(k, None)
+def base_env() -> dict:
+    """Environment for agent and checks: allowlisted only, paths inside the staging clone."""
+    env = {k: v for k, v in os.environ.items() if k in ENV_ALLOW or k.startswith(ENV_ALLOW_PREFIXES)}
     # opencode takes its working directory from $PWD, not from the process cwd; the inherited
     # PWD points at the live checkout, which made the agent edit it directly.
     env["PWD"] = str(WORK_DIR)
+    # run.sh points UV_PROJECT_ENVIRONMENT at the live venv; `uv add`/`uv sync` in the clone
+    # must not change the venv the live app runs from.
+    env["UV_PROJECT_ENVIRONMENT"] = str(WORK_DIR / ".venv")
+    # Own uv cache: the shared one feeds the live venv's `uv sync`, so it must not be writable.
+    env["UV_CACHE_DIR"] = str(SANDBOX_DIR / "uv-cache")
     return env
+
+
+def agent_secrets() -> set[str]:
+    """Variables opencode needs: those the *live* opencode.json references (the clone's copy is
+    agent-editable), plus TIX_AGENT_ENV."""
+    names = set(filter(None, (n.strip() for n in os.environ.get("TIX_AGENT_ENV", "").split(","))))
+    cfg = ROOT / "opencode.json"
+    if cfg.exists():
+        names |= set(re.findall(r"\{env:([A-Za-z_][A-Za-z0-9_]*)\}", cfg.read_text(encoding="utf-8")))
+    return names
+
+
+def agent_env() -> dict:
+    env = base_env()
+    env.update({k: os.environ[k] for k in agent_secrets() if k in os.environ})
+    env.setdefault("OPENCODE_DISABLE_AUTOUPDATE", "1")
+    return env
+
+
+def env_list(name: str) -> list[str]:
+    return [x.strip() for x in os.environ.get(name, "").split(",") if x.strip()]
+
+
+def model_domains() -> list[str]:
+    """Hosts of the provider baseURLs in the live opencode.json."""
+    try:
+        providers = json.loads((ROOT / "opencode.json").read_text(encoding="utf-8")).get("provider", {})
+    except (OSError, ValueError):
+        return []
+    urls = [(p.get("options") or {}).get("baseURL", "") for p in providers.values() if isinstance(p, dict)]
+    return [h for h in (urlparse(u).hostname for u in urls) if h]
+
+
+def write_srt_settings(name: str, domains: list[str]) -> Path:
+    home = Path.home()
+
+    def xdg(var: str, default: str) -> Path:
+        return Path(os.environ.get(var) or home / default)
+
+    writable = [
+        WORK_DIR, Path(tempfile.gettempdir()), SANDBOX_DIR / "uv-cache",
+        # opencode keeps sessions (needed for follow-ups), logs and provider packages here
+        xdg("XDG_DATA_HOME", ".local/share") / "opencode",
+        xdg("XDG_STATE_HOME", ".local/state") / "opencode",
+        xdg("XDG_CACHE_HOME", ".cache") / "opencode",
+        *map(Path, env_list("TIX_SANDBOX_WRITE")),
+    ]
+    for d in writable:
+        d.mkdir(parents=True, exist_ok=True)
+    deny_read = [ROOT, *(home / p for p in SECRET_PATHS), *map(Path, env_list("TIX_SANDBOX_DENY_READ"))]
+    if Path("/mnt").is_dir():  # WSL: the Windows drives (and the Windows home with its keys)
+        deny_read.append(Path("/mnt"))
+    settings = {
+        "network": {"allowedDomains": sorted(set(domains)), "deniedDomains": []},
+        "filesystem": {
+            "denyRead": [str(p) for p in deny_read],
+            # the clone and the interpreter the checks run with, should either live under ROOT
+            "allowRead": [str(WORK_DIR), sys.prefix],
+            "allowWrite": [str(p) for p in writable],
+            # the worker runs git in the clone outside the sandbox, so its .git (hooks, config,
+            # commondir, alternates) must not be agent-controlled; the agent has no git to do anyway
+            "denyWrite": [str(WORK_DIR / ".git")],
+        },
+    }
+    SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
+    path = SANDBOX_DIR / f"{name}.json"
+    path.write_text(json.dumps(settings, indent=2))
+    return path
+
+
+def sandboxed(cmd: list[str], name: str, domains: list[str]) -> list[str]:
+    if SANDBOX == "off":
+        return cmd
+    return [SRT, "--settings", str(write_srt_settings(name, domains)), "--", *cmd]
+
+
+def sandbox_problem() -> str | None:
+    if SANDBOX == "off":
+        return None
+    if SANDBOX != "srt":
+        return f"Unknown TIX_SANDBOX={SANDBOX!r} (use srt or off)."
+    if not shutil.which(SRT):
+        return (f"Sandbox command {SRT!r} not found. Install it (npm install -g @anthropic-ai/sandbox-runtime, "
+                "plus bubblewrap, socat and ripgrep), or set TIX_SANDBOX=off to run the agent unsandboxed.")
+    return None
 
 
 class RunLog:
@@ -130,10 +242,13 @@ def run_agent(prompt: str, model: str, session_id: str | None, log: RunLog, run_
     if session_id:
         cmd += ["--session", session_id]
     cmd.append(prompt)
-    log.write(f"$ opencode run --model {model}" + (f" --session {session_id}" if session_id else ""))
+    domains = [*DEFAULT_DOMAINS, *model_domains(), *env_list("TIX_SANDBOX_DOMAINS")]
+    cmd = sandboxed(cmd, "agent", domains)
+    log.write(f"$ opencode run --model {model}" + (f" --session {session_id}" if session_id else "")
+              + f"  [sandbox: {SANDBOX}]")
 
     proc = subprocess.Popen(
-        cmd, cwd=WORK_DIR, env=child_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        cmd, cwd=WORK_DIR, env=agent_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1,
         start_new_session=True,
     )
@@ -175,13 +290,47 @@ def run_agent(prompt: str, model: str, session_id: str | None, log: RunLog, run_
     return proc.returncode, state["session"], state["last_text"], cancelled
 
 
-def run_checks(log: RunLog) -> tuple[bool, str]:
+def check_migrations(live_head: str) -> tuple[bool, str]:
+    problems = runs.migration_problems(WORK_DIR, live_head)
+    return not problems, "\n".join(problems)
+
+
+def check_data_kept() -> tuple[bool, str]:
+    """Apply the clone's migrations to a fresh copy of the live DB; no table may vanish or shrink."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "tickets.db"
+        copy_db(db_path(), path)
+        conn = connect(path)
+        try:
+            def counts():
+                tables = [r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")]
+                return {t: conn.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0] for t in tables}
+            before = counts()
+            try:
+                migrate(conn, WORK_DIR / "app" / "migrations")
+            except sqlite3.Error as e:
+                return False, f"applying migrations to a copy of the live DB failed: {e}"
+            after = counts()
+        finally:
+            conn.close()
+    lost = [f"table {t}: {n} rows before, {after[t] if t in after else 'table gone'} after"
+            for t, n in before.items() if after.get(t, -1) < n]
+    return not lost, "Migrations lost existing data:\n" + "\n".join(lost) if lost else ""
+
+
+def run_checks(log: RunLog, live_head: str) -> tuple[bool, str]:
     """Checks defined here (not in the agent-editable smoke.py alone) gate every change."""
-    for name, cmd in CHECKS:
+    checks = [("migrations", lambda: check_migrations(live_head)), *CHECKS, ("data", check_data_kept)]
+    for name, cmd in checks:
         log.write(f"$ check: {name}")
         try:
-            r = subprocess.run(cmd, cwd=WORK_DIR, env=child_env(), capture_output=True, text=True, timeout=180)
-            out, ok = (r.stdout + r.stderr).strip(), r.returncode == 0
+            if callable(cmd):
+                ok, out = cmd()
+            else:
+                r = subprocess.run(sandboxed(cmd, "checks", []), cwd=WORK_DIR, env=base_env(),
+                                   capture_output=True, text=True, timeout=180)
+                out, ok = (r.stdout + r.stderr).strip(), r.returncode == 0
         except subprocess.TimeoutExpired:
             out, ok = f"check '{name}' timed out after 180s", False
         if out:
@@ -243,6 +392,11 @@ def process(run_id: int) -> bool:
 
     log = RunLog(run_id)
     try:
+        problem = sandbox_problem()
+        if problem:
+            log.write("!! " + problem)
+            finish(conn, run_id, "failed", error=problem)
+            return True
         sha = gitops.commit_manual_changes(f"before ticket #{t['id']}")
         if sha:
             log.write(f"Committed pending manual changes in the live checkout as {sha[:10]}.")
@@ -251,6 +405,7 @@ def process(run_id: int) -> bool:
             (t["id"],),
         ).fetchone()
         base_ref = pending["branch"] if pending and gitops.branch_exists(pending["branch"]) else "HEAD"
+        live_head = gitops.head()
         base = gitops.create_staging(WORK_DIR, branch, base_ref)
         copy_db(db_path(), WORK_DIR / "data" / "tickets.db")
         log.write(f"Staging clone {WORK_DIR} on {branch} (from {base_ref}, {base[:10]}) with a copy of the DB.")
@@ -261,6 +416,7 @@ def process(run_id: int) -> bool:
             "Implement this, then reply with a short summary of what you changed."
         )
         rc, sid, summary, cancelled = run_agent(prompt, t["model"], t["session_id"], log, run_id)
+        gitops.sanitize_staging(WORK_DIR)
         if sid and sid != t["session_id"]:
             conn.execute("UPDATE tickets SET session_id = ? WHERE id = ?", (sid, t["id"]))
             conn.commit()
@@ -274,21 +430,23 @@ def process(run_id: int) -> bool:
                 finish(conn, run_id, "failed", error=f"opencode exited with code {rc}; see log.")
             return True
 
-        ok, out = run_checks(log)
+        ok, out = run_checks(log, live_head)
         for attempt in range(FIX_ATTEMPTS):
             if ok:
                 break
             log.write(f"-- asking agent to fix the failing check (attempt {attempt + 1}/{FIX_ATTEMPTS})")
             fix_prompt = (
                 "After your change, a required check fails:\n\n"
-                f"{out[-6000:]}\n\nFix the problem so all checks (compile, import, `python smoke.py`) pass, "
+                f"{out[-6000:]}\n\nFix the problem so all checks (compile, import, `python smoke.py`, "
+                "migration rules, no lost data) pass, "
                 "without dropping the ticket's goal."
             )
             rc, sid, s2, cancelled = run_agent(fix_prompt, t["model"], sid, log, run_id)
+            gitops.sanitize_staging(WORK_DIR)
             summary = s2 or summary
             if cancelled or rc != 0:
                 break
-            ok, out = run_checks(log)
+            ok, out = run_checks(log, live_head)
 
         if live_checkout_touched(run_id, log):
             keep_attempt(base, branch, f"tix run {run_id} (ticket #{t['id']}): wrote to live checkout", log)
@@ -369,7 +527,9 @@ def main() -> None:
     if MODE == "normal" and not gitops.has_tag(gitops.GOOD_WORKER_TAG):
         gitops.tag_good_worker(start_head)
     write_status(start_head)
-    print(f"[worker] ready (pid {os.getpid()}, mode {MODE}, work dir {WORK_DIR})", flush=True)
+    print(f"[worker] ready (pid {os.getpid()}, mode {MODE}, sandbox {SANDBOX}, work dir {WORK_DIR})", flush=True)
+    if sandbox_problem():
+        print(f"[worker] WARNING: {sandbox_problem()}", flush=True)
     while True:
         if gitops.head() != start_head:
             print("[worker] live HEAD moved; restarting to pick up code changes", flush=True)

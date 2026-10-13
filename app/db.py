@@ -36,7 +36,7 @@ def copy_db(src: Path, dst: Path) -> None:
     d.close()
 
 
-def migrate(conn: sqlite3.Connection) -> list[str]:
+def migrate(conn: sqlite3.Connection, migrations_dir: Path = MIGRATIONS_DIR) -> list[str]:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations ("
         " name TEXT PRIMARY KEY,"
@@ -45,7 +45,7 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
     conn.commit()
     done = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
     applied = []
-    for f in sorted(MIGRATIONS_DIR.glob("*.sql")):
+    for f in sorted(migrations_dir.glob("*.sql")):
         if f.name in done:
             continue
         sql = f.read_text(encoding="utf-8")
